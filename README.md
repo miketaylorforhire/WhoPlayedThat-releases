@@ -10,7 +10,7 @@ is instant. No account, no cloud, no telemetry.
 
 ## Download
 
-Latest release: **[v0.1.4](https://github.com/miketaylorforhire/WhoPlayedThat-releases/releases/latest)**
+**[Latest release →](https://github.com/miketaylorforhire/WhoPlayedThat-releases/releases/latest)**
 
 Grab `Who Played That Setup.exe` from the assets list, run it, and
 follow the wizard.
