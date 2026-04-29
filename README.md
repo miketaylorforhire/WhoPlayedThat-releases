@@ -42,7 +42,7 @@ Point it at your music folder. It plays everything from disk — **MP3, FLAC, M4
 
 **[Latest release →](https://github.com/miketaylorforhire/WhoPlayedThat-releases/releases/latest)**
 
-Grab `Who Played That Setup.exe` from the assets list, run it, and follow the wizard.
+Grab `Who.Played.That.Setup.exe` from the assets list, run it, and follow the wizard.
 
 > **First-run SmartScreen warning** — the installer is not yet code-signed, so Windows will show *"Windows protected your PC"* the first time you run it. Click **More info → Run anyway**. Subsequent updates install through the wizard without prompting.
 
