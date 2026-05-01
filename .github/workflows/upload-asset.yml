@@ -1,0 +1,67 @@
+name: Upload installer to release
+
+# Triggered by pushing a binary to a `pipe/<tag>` branch with a metadata file
+# RELEASE_TAG that names the target release. The runner pulls the LFS object
+# and uploads it as the release asset. This bypasses uploads.github.com from
+# the developer's machine — the upload is GitHub-internal.
+on:
+  push:
+    branches:
+      - 'pipe/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload to (e.g. v0.2.17)'
+        required: true
+      branch:
+        description: 'Pipe branch to read from'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref_name }}
+          lfs: true
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ -f RELEASE_TAG ]; then
+            echo "tag=$(cat RELEASE_TAG | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no RELEASE_TAG file and no manual tag input"
+            exit 1
+          fi
+
+      - name: Find installer
+        id: file
+        shell: bash
+        run: |
+          path=$(find . -maxdepth 2 -name '*.exe' | head -n1)
+          if [ -z "$path" ]; then
+            echo "::error::no .exe in pipe branch"
+            exit 1
+          fi
+          name=$(basename "$path")
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -lh "$path"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.file.outputs.path }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
