@@ -1,0 +1,157 @@
+name: Mirror release from primary
+
+# Copy a release's assets from the primary releases repo into this one, so the
+# bytes travel GitHub to GitHub instead of being uploaded a second time from the
+# machine that cut the release.
+#
+# Why this exists: every app installed before the repo move has
+# miketaylorforhire compiled into its auto-updater, so each release must land
+# here too or those users silently stop getting updates. That mirroring used to
+# re-upload all three assets (~475 MB) from a home connection that already had
+# to carry them once. On a good day that was invisible; on a bad one it was the
+# difference between a release taking minutes and taking hours.
+#
+# No credential is needed to read the primary: it is a public repo, so its
+# release metadata and asset downloads are open. Writing here uses the
+# automatic GITHUB_TOKEN. That is the whole trick — no cross-account PAT.
+#
+# Idempotent. An asset already present at the right byte size is left alone, so
+# a re-dispatch after a partial run only moves what is missing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to mirror, e.g. v0.5.30'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never two runs on the same tag; a second one would race the first's uploads.
+  group: mirror-release-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REPO: whoplayedthat/WhoPlayedThat-releases
+      TAG: ${{ github.event.inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Read the primary release
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$SOURCE_REPO/releases/tags/$TAG"
+          code=$(curl -sS -o /tmp/src.json -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' "$api")
+          if [ "$code" != "200" ]; then
+            echo "::error::No release $TAG in $SOURCE_REPO (HTTP $code). Publish the primary first."
+            head -c 300 /tmp/src.json; echo
+            exit 1
+          fi
+          # A draft has no public assets to copy, and mirroring one would
+          # publish bytes the primary has not released yet.
+          if [ "$(jq -r '.draft' /tmp/src.json)" = "true" ]; then
+            echo "::error::$TAG is still a draft in $SOURCE_REPO. Publish it first."
+            exit 1
+          fi
+          count=$(jq '.assets | length' /tmp/src.json)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::$TAG has no assets in $SOURCE_REPO."
+            exit 1
+          fi
+          jq -r '.body // ""' /tmp/src.json > /tmp/notes.md
+          jq -r '.assets[] | [.name, (.size|tostring), .browser_download_url] | @tsv' /tmp/src.json > /tmp/assets.tsv
+          echo "### Mirroring $TAG" >> "$GITHUB_STEP_SUMMARY"
+          cut -f1,2 /tmp/assets.tsv >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make sure the release exists here
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release exists — refreshing its notes"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file /tmp/notes.md
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes-file /tmp/notes.md --draft
+          fi
+
+      - name: Copy the assets
+        run: |
+          set -uo pipefail
+          # What is already here, so a re-run after a partial copy does not
+          # re-fetch what landed. Size rather than mere presence: a truncated
+          # asset from an interrupted run has to be replaced, not kept.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[] | [.name, (.size|tostring)] | @tsv' > /tmp/have.tsv || : > /tmp/have.tsv
+
+          rc=0
+          while IFS=$'\t' read -r name size url; do
+            [ -n "$name" ] || continue
+            have=$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' /tmp/have.tsv | head -n1)
+            if [ "$have" = "$size" ]; then
+              echo "  $name already here ($size bytes) — skipping"
+              continue
+            fi
+            echo "  fetching $name ($size bytes)"
+            if ! curl -sSL --fail --retry 3 --retry-delay 5 -o "/tmp/$name" "$url"; then
+              echo "::error::download failed: $name"; rc=1; continue
+            fi
+            got=$(stat -c %s "/tmp/$name")
+            if [ "$got" != "$size" ]; then
+              echo "::error::$name came down $got bytes, expected $size"; rc=1; rm -f "/tmp/$name"; continue
+            fi
+            # --clobber so a size mismatch above replaces rather than collides.
+            if gh release upload "$TAG" "/tmp/$name" --repo "$GITHUB_REPOSITORY" --clobber; then
+              echo "  uploaded $name"
+            else
+              echo "::error::upload failed: $name"; rc=1
+            fi
+            rm -f "/tmp/$name"
+          done < /tmp/assets.tsv
+          exit $rc
+
+      - name: Publish and verify
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+          # Verify against what the updater actually reads, rather than trusting
+          # the exit codes above: every asset present at the primary's byte size,
+          # and /releases/latest pointing here.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[] | [.name, (.size|tostring)] | @tsv' > /tmp/mine.tsv
+          bad=0
+          while IFS=$'\t' read -r name size url; do
+            [ -n "$name" ] || continue
+            mine=$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' /tmp/mine.tsv | head -n1)
+            if [ "$mine" != "$size" ]; then
+              echo "::error::$name is $mine here, $size at the primary"; bad=1
+            fi
+          done < /tmp/assets.tsv
+
+          # Read /releases/latest more than once before believing it. It lags a
+          # moment behind `release edit --latest`, and reading it a single time
+          # is what made publish-release.mjs report failure on six releases in a
+          # row (0.4.56 through 0.4.61) that had published perfectly well. The
+          # `|| latest=` also keeps one transient blip from killing the step
+          # under `set -e -o pipefail`.
+          latest=''
+          for attempt in 1 2 3 4 5; do
+            latest=$(curl -sS -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest" \
+              | jq -r '.tag_name // ""') || latest=''
+            [ "$latest" = "$TAG" ] && break
+            sleep $((attempt * 2))
+          done
+          if [ "$latest" != "$TAG" ]; then
+            echo "::error::/releases/latest is $latest, expected $TAG"; bad=1
+          fi
+          if [ "$bad" -eq 0 ]; then
+            echo "all assets match the primary, latest is $TAG" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $bad
